@@ -18,12 +18,16 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
     private var windowStatusLabel: NSTextField!
     private var startButton: NSButton!
     private var stopButton: NSButton!
+    private var isFinishingRecording = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("applicationDidFinishLaunching")
         NSApplication.shared.setActivationPolicy(.regular)
         recorder.onRecordingError = { [weak self] error in
             self?.handleRecordingError(error)
+        }
+        recorder.onSilenceTimeout = { [weak self] in
+            self?.handleSilenceTimeout()
         }
         try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         configureMenu()
@@ -159,9 +163,10 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
                 let outputURL = makeOutputURL(extension: "m4a")
                 try await recorder.start(outputURL: outputURL)
                 await MainActor.run {
+                    self.isFinishingRecording = false
                     self.statusItem.button?.image = NSImage(systemSymbolName: "record.circle.fill", accessibilityDescription: "正在录制")
-                    self.statusItemText.title = "正在录制系统音频"
-                    self.windowStatusLabel.stringValue = "正在录制系统音频"
+                    self.statusItemText.title = "正在录制，静音后自动转写"
+                    self.windowStatusLabel.stringValue = "正在录制，视频结束后会自动转写"
                     self.startItem.isEnabled = false
                     self.stopItem.isEnabled = true
                     self.startButton.isEnabled = false
@@ -175,7 +180,15 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
     }
 
     @objc private func stopRecording() {
-        setBusy("正在转写...")
+        finishRecording(autoTriggered: false)
+    }
+
+    private func finishRecording(autoTriggered: Bool) {
+        guard !isFinishingRecording else {
+            return
+        }
+        isFinishingRecording = true
+        setBusy(autoTriggered ? "检测到视频结束，正在转写..." : "正在转写...")
         Task {
             do {
                 let audioURL = try await recorder.stop()
@@ -190,6 +203,7 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
                     self.statusItem.button?.image = NSImage(systemSymbolName: "waveform.and.mic", accessibilityDescription: "微信视频文稿")
                     self.statusItemText.title = "已生成：\(mdURL.lastPathComponent)"
                     self.windowStatusLabel.stringValue = "已生成：\(mdURL.lastPathComponent)"
+                    self.isFinishingRecording = false
                     self.startItem.isEnabled = true
                     self.stopItem.isEnabled = false
                     self.startButton.isEnabled = true
@@ -198,7 +212,10 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
                 }
             } catch {
                 await showError("无法完成转写", error)
-                await MainActor.run { self.setIdle() }
+                await MainActor.run {
+                    self.isFinishingRecording = false
+                    self.setIdle()
+                }
             }
         }
     }
@@ -249,8 +266,15 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
 
     private func handleRecordingError(_ error: Error) {
         Task { @MainActor in
+            self.isFinishingRecording = false
             self.setIdle()
             self.showError("录制已停止", error)
+        }
+    }
+
+    private func handleSilenceTimeout() {
+        Task { @MainActor in
+            self.finishRecording(autoTriggered: true)
         }
     }
 
@@ -278,13 +302,20 @@ app.run()
 
 final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     var onRecordingError: ((Error) -> Void)?
+    var onSilenceTimeout: (() -> Void)?
 
     private var stream: SCStream?
     private var writer: AVAssetWriter?
     private var audioInput: AVAssetWriterInput?
     private var outputURL: URL?
     private var didStartSession = false
+    private var recordingStartTime: CMTime?
+    private var lastAudibleTime: CMTime?
+    private var didTriggerSilenceTimeout = false
     private let sampleQueue = DispatchQueue(label: "local.codex.WeChatTranscript.samples")
+    private let silenceThresholdDB = -50.0
+    private let silenceTimeoutSeconds = 12.0
+    private let minimumAutoStopSeconds = 20.0
 
     func start(outputURL: URL) async throws {
         if stream != nil {
@@ -332,6 +363,9 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         self.audioInput = audioInput
         self.stream = stream
         self.didStartSession = false
+        self.recordingStartTime = nil
+        self.lastAudibleTime = nil
+        self.didTriggerSilenceTimeout = false
 
         try await stream.startCapture()
     }
@@ -359,6 +393,9 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         self.audioInput = nil
         self.outputURL = nil
         self.didStartSession = false
+        self.recordingStartTime = nil
+        self.lastAudibleTime = nil
+        self.didTriggerSilenceTimeout = false
 
         return outputURL
     }
@@ -383,6 +420,7 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         if writer.status == .writing, audioInput.isReadyForMoreMediaData {
             audioInput.append(sampleBuffer)
         }
+        updateSilenceState(with: sampleBuffer)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -393,11 +431,134 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             self.audioInput = nil
             self.outputURL = nil
             self.didStartSession = false
+            self.recordingStartTime = nil
+            self.lastAudibleTime = nil
+            self.didTriggerSilenceTimeout = false
 
             DispatchQueue.main.async {
                 self.onRecordingError?(error)
             }
         }
+    }
+
+    private func updateSilenceState(with sampleBuffer: CMSampleBuffer) {
+        let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        if recordingStartTime == nil {
+            recordingStartTime = timestamp
+            lastAudibleTime = timestamp
+        }
+        guard !didTriggerSilenceTimeout,
+              let recordingStartTime,
+              let level = sampleBuffer.rmsDecibels else {
+            return
+        }
+
+        if level > silenceThresholdDB {
+            lastAudibleTime = timestamp
+            return
+        }
+
+        let elapsed = max(0, timestamp.seconds - recordingStartTime.seconds)
+        let silenceElapsed = max(0, timestamp.seconds - (lastAudibleTime ?? recordingStartTime).seconds)
+        if elapsed >= minimumAutoStopSeconds, silenceElapsed >= silenceTimeoutSeconds {
+            didTriggerSilenceTimeout = true
+            DispatchQueue.main.async {
+                self.onSilenceTimeout?()
+            }
+        }
+    }
+}
+
+private extension CMSampleBuffer {
+    var rmsDecibels: Double? {
+        guard let formatDescription = CMSampleBufferGetFormatDescription(self),
+              let streamDescription = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription) else {
+            return nil
+        }
+
+        let asbd = streamDescription.pointee
+        var neededSize = 0
+        var blockBuffer: CMBlockBuffer?
+        var status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            self,
+            bufferListSizeNeededOut: &neededSize,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: kCFAllocatorDefault,
+            blockBufferMemoryAllocator: kCFAllocatorDefault,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        )
+        guard status == noErr, neededSize > 0 else {
+            return nil
+        }
+
+        let rawBufferList = UnsafeMutableRawPointer.allocate(
+            byteCount: neededSize,
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer {
+            rawBufferList.deallocate()
+        }
+        let audioBufferList = rawBufferList.bindMemory(to: AudioBufferList.self, capacity: 1)
+        status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            self,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: audioBufferList,
+            bufferListSize: neededSize,
+            blockBufferAllocator: kCFAllocatorDefault,
+            blockBufferMemoryAllocator: kCFAllocatorDefault,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        )
+        guard status == noErr else {
+            return nil
+        }
+
+        let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
+        let isFloat = asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0
+        let isSignedInteger = asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger != 0
+        let bitsPerChannel = Int(asbd.mBitsPerChannel)
+
+        var sumSquares = 0.0
+        var sampleCount = 0
+        for buffer in buffers {
+            guard let data = buffer.mData else {
+                continue
+            }
+            let byteCount = Int(buffer.mDataByteSize)
+            if isFloat, bitsPerChannel == 32 {
+                let count = byteCount / MemoryLayout<Float>.stride
+                let samples = data.bindMemory(to: Float.self, capacity: count)
+                for index in 0..<count {
+                    let value = Double(samples[index])
+                    sumSquares += value * value
+                }
+                sampleCount += count
+            } else if isSignedInteger, bitsPerChannel == 16 {
+                let count = byteCount / MemoryLayout<Int16>.stride
+                let samples = data.bindMemory(to: Int16.self, capacity: count)
+                for index in 0..<count {
+                    let value = Double(samples[index]) / Double(Int16.max)
+                    sumSquares += value * value
+                }
+                sampleCount += count
+            } else if isSignedInteger, bitsPerChannel == 32 {
+                let count = byteCount / MemoryLayout<Int32>.stride
+                let samples = data.bindMemory(to: Int32.self, capacity: count)
+                for index in 0..<count {
+                    let value = Double(samples[index]) / Double(Int32.max)
+                    sumSquares += value * value
+                }
+                sampleCount += count
+            }
+        }
+
+        guard sampleCount > 0 else {
+            return nil
+        }
+        let rms = sqrt(sumSquares / Double(sampleCount))
+        return 20 * log10(max(rms, 0.000_000_000_001))
     }
 }
 
