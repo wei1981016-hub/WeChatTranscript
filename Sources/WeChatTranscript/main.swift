@@ -22,6 +22,9 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         log("applicationDidFinishLaunching")
         NSApplication.shared.setActivationPolicy(.regular)
+        recorder.onRecordingError = { [weak self] error in
+            self?.handleRecordingError(error)
+        }
         try? FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         configureMenu()
         configureWindow()
@@ -149,6 +152,10 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
         setBusy("准备录制...")
         Task {
             do {
+                let speechStatus = await SpeechTranscriber.requestAuthorization()
+                guard speechStatus == .authorized else {
+                    throw TranscriptionError.speechPermissionDenied
+                }
                 let outputURL = makeOutputURL(extension: "m4a")
                 try await recorder.start(outputURL: outputURL)
                 await MainActor.run {
@@ -240,6 +247,13 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
         alert.runModal()
     }
 
+    private func handleRecordingError(_ error: Error) {
+        Task { @MainActor in
+            self.setIdle()
+            self.showError("录制已停止", error)
+        }
+    }
+
     private func log(_ message: String) {
         let line = "\(Date()) \(message)\n"
         let url = URL(fileURLWithPath: "/tmp/WeChatTranscript.log")
@@ -263,6 +277,8 @@ app.setActivationPolicy(.regular)
 app.run()
 
 final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
+    var onRecordingError: ((Error) -> Void)?
+
     private var stream: SCStream?
     private var writer: AVAssetWriter?
     private var audioInput: AVAssetWriterInput?
@@ -299,9 +315,12 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         configuration.excludesCurrentProcessAudio = true
         configuration.sampleRate = 48_000
         configuration.channelCount = 2
-        configuration.width = display.width
-        configuration.height = display.height
-        configuration.queueDepth = 5
+        // Keep a tiny screen stream attached: audio-only capture produced silent buffers
+        // on tested macOS/WeChat combinations, while a minimal screen stream unlocks audio.
+        configuration.width = 2
+        configuration.height = 2
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 2)
+        configuration.queueDepth = 1
 
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
@@ -367,12 +386,17 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        DispatchQueue.main.async {
-            let alert = NSAlert()
-            alert.messageText = "录制已停止"
-            alert.informativeText = error.localizedDescription
-            alert.alertStyle = .warning
-            alert.runModal()
+        sampleQueue.async {
+            self.writer?.cancelWriting()
+            self.stream = nil
+            self.writer = nil
+            self.audioInput = nil
+            self.outputURL = nil
+            self.didStartSession = false
+
+            DispatchQueue.main.async {
+                self.onRecordingError?(error)
+            }
         }
     }
 }
@@ -385,7 +409,7 @@ final class SpeechTranscriber {
     }
 
     func transcribe(audioURL: URL) async throws -> String {
-        let authStatus = await requestAuthorization()
+        let authStatus = await Self.requestAuthorization()
         guard authStatus == .authorized else {
             throw TranscriptionError.speechPermissionDenied
         }
@@ -398,30 +422,64 @@ final class SpeechTranscriber {
 
         let request = SFSpeechURLRecognitionRequest(url: audioURL)
         request.shouldReportPartialResults = false
+        if recognizer.supportsOnDeviceRecognition {
+            request.requiresOnDeviceRecognition = true
+        }
         if #available(macOS 13.0, *) {
             request.addsPunctuation = true
         }
 
-        return try await withCheckedThrowingContinuation { continuation in
+        let timeoutNanoseconds = Self.timeoutNanoseconds(for: audioURL)
+
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+            let stateQueue = DispatchQueue(label: "local.codex.WeChatTranscript.speech")
             var didResume = false
-            _ = recognizer.recognitionTask(with: request) { result, error in
-                if let result, result.isFinal, !didResume {
+            var recognitionTask: SFSpeechRecognitionTask?
+
+            func finish(_ result: Result<String, Error>) {
+                stateQueue.async {
+                    guard !didResume else {
+                        return
+                    }
                     didResume = true
-                    continuation.resume(returning: result.bestTranscription.formattedString)
-                } else if let error, !didResume {
-                    didResume = true
-                    continuation.resume(throwing: error)
+                    recognitionTask?.cancel()
+                    switch result {
+                    case .success(let transcript):
+                        continuation.resume(returning: transcript)
+                    case .failure(let error):
+                        continuation.resume(throwing: error)
+                    }
                 }
+            }
+
+            recognitionTask = recognizer.recognitionTask(with: request) { result, error in
+                if let result, result.isFinal {
+                    finish(.success(result.bestTranscription.formattedString))
+                } else if let error {
+                    finish(.failure(error))
+                }
+            }
+
+            Task {
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                finish(.failure(TranscriptionError.transcriptionTimedOut))
             }
         }
     }
 
-    private func requestAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
+    static func requestAuthorization() async -> SFSpeechRecognizerAuthorizationStatus {
         await withCheckedContinuation { continuation in
             SFSpeechRecognizer.requestAuthorization { status in
                 continuation.resume(returning: status)
             }
         }
+    }
+
+    private static func timeoutNanoseconds(for audioURL: URL) -> UInt64 {
+        let asset = AVURLAsset(url: audioURL)
+        let seconds = CMTimeGetSeconds(asset.duration)
+        let boundedSeconds = min(max(seconds.isFinite ? seconds * 4 : 300, 60), 1_800)
+        return UInt64(boundedSeconds * 1_000_000_000)
     }
 }
 
@@ -452,11 +510,16 @@ enum DraftOrganizer {
     }
 
     private static func normalize(_ text: String) -> String {
-        text
-            .replacingOccurrences(of: "嗯", with: "")
-            .replacingOccurrences(of: "呃", with: "")
-            .replacingOccurrences(of: "啊", with: "")
-            .replacingOccurrences(of: "  ", with: " ")
+        var cleaned = text
+        for filler in ["嗯", "呃"] {
+            cleaned = cleaned.replacingOccurrences(
+                of: "(^|[，。！？!?、\\s])\(filler)(?=[，。！？!?、\\s])",
+                with: "$1",
+                options: .regularExpression
+            )
+        }
+        return cleaned
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -533,6 +596,7 @@ enum RecorderError: LocalizedError {
 enum TranscriptionError: LocalizedError {
     case speechPermissionDenied
     case recognizerUnavailable
+    case transcriptionTimedOut
 
     var errorDescription: String? {
         switch self {
@@ -540,6 +604,8 @@ enum TranscriptionError: LocalizedError {
             return "没有语音识别权限，请在系统设置中允许本应用使用语音识别。"
         case .recognizerUnavailable:
             return "中文语音识别服务暂不可用。"
+        case .transcriptionTimedOut:
+            return "语音识别超时，请尝试缩短录制时长或分段转写。"
         }
     }
 }
