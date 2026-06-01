@@ -13,6 +13,7 @@ $(APP_DIR): Sources/WeChatTranscript/main.swift Resources/Info.plist
 	mkdir -p "$(APP_DIR)/Contents/Resources"
 	mkdir -p "$(BUILD_DIR)/module-cache"
 	cp Resources/Info.plist "$(APP_DIR)/Contents/Info.plist"
+	cp Resources/AppIcon.icns "$(APP_DIR)/Contents/Resources/AppIcon.icns"
 	xcrun swiftc \
 		-target arm64-apple-macos14.0 \
 		-module-cache-path "$(BUILD_DIR)/module-cache" \

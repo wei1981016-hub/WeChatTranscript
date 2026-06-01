@@ -4,4 +4,4 @@ dist/
 *.xcuserdata/
 DerivedData/
 *.log
-
+Resources/AppIcon.iconset/
