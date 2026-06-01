@@ -299,12 +299,13 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         configuration.excludesCurrentProcessAudio = true
         configuration.sampleRate = 48_000
         configuration.channelCount = 2
-        configuration.width = 2
-        configuration.height = 2
-        configuration.queueDepth = 3
+        configuration.width = display.width
+        configuration.height = display.height
+        configuration.queueDepth = 5
 
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: sampleQueue)
 
         self.outputURL = outputURL
@@ -344,12 +345,18 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of outputType: SCStreamOutputType) {
-        guard outputType == .audio, sampleBuffer.isValid, let writer, let audioInput else {
+        guard outputType == .audio else {
+            return
+        }
+
+        guard sampleBuffer.isValid, let writer, let audioInput else {
             return
         }
 
         if !didStartSession {
-            writer.startWriting()
+            guard writer.startWriting() else {
+                return
+            }
             writer.startSession(atSourceTime: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
             didStartSession = true
         }
