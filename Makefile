@@ -21,7 +21,6 @@ $(APP_DIR): Sources/WeChatTranscript/main.swift Resources/Info.plist
 		-framework AppKit \
 		-framework AVFoundation \
 		-framework ScreenCaptureKit \
-		-framework Speech \
 		-framework UniformTypeIdentifiers \
 		Sources/WeChatTranscript/main.swift \
 		-o "$(BIN)"
