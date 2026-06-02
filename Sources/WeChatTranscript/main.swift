@@ -13,11 +13,13 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
 
     private var startItem: NSMenuItem!
     private var stopItem: NSMenuItem!
+    private var retranscribeItem: NSMenuItem!
     private var statusItemText: NSMenuItem!
     private var window: NSWindow!
     private var windowStatusLabel: NSTextField!
     private var startButton: NSButton!
     private var stopButton: NSButton!
+    private var retranscribeButton: NSButton!
     private var isFinishingRecording = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -51,12 +53,14 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
         statusItemText = NSMenuItem(title: "空闲", action: nil, keyEquivalent: "")
         startItem = NSMenuItem(title: "开始录制", action: #selector(startRecording), keyEquivalent: "r")
         stopItem = NSMenuItem(title: "停止并转写", action: #selector(stopRecording), keyEquivalent: "s")
+        retranscribeItem = NSMenuItem(title: "转写最新录音", action: #selector(retranscribeLatestRecording), keyEquivalent: "t")
         let showWindowItem = NSMenuItem(title: "显示控制窗口", action: #selector(showControlWindow), keyEquivalent: "w")
         let openFolderItem = NSMenuItem(title: "打开输出文件夹", action: #selector(openOutputFolder), keyEquivalent: "o")
         let quitItem = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q")
 
         startItem.target = self
         stopItem.target = self
+        retranscribeItem.target = self
         showWindowItem.target = self
         openFolderItem.target = self
         quitItem.target = self
@@ -66,6 +70,7 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(startItem)
         menu.addItem(stopItem)
+        menu.addItem(retranscribeItem)
         menu.addItem(.separator())
         menu.addItem(showWindowItem)
         menu.addItem(openFolderItem)
@@ -76,39 +81,44 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
 
     private func configureWindow() {
         log("configureWindow")
-        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 190))
+        let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 540, height: 210))
 
         let titleLabel = NSTextField(labelWithString: "微信视频文稿")
         titleLabel.font = .systemFont(ofSize: 20, weight: .semibold)
-        titleLabel.frame = NSRect(x: 24, y: 140, width: 260, height: 28)
+        titleLabel.frame = NSRect(x: 24, y: 158, width: 260, height: 28)
 
         windowStatusLabel = NSTextField(labelWithString: "空闲")
         windowStatusLabel.font = .systemFont(ofSize: 13)
         windowStatusLabel.textColor = .secondaryLabelColor
-        windowStatusLabel.frame = NSRect(x: 24, y: 112, width: 360, height: 22)
+        windowStatusLabel.frame = NSRect(x: 24, y: 130, width: 480, height: 22)
 
         startButton = NSButton(title: "开始录制", target: self, action: #selector(startRecording))
         startButton.bezelStyle = .rounded
-        startButton.frame = NSRect(x: 24, y: 58, width: 112, height: 34)
+        startButton.frame = NSRect(x: 24, y: 70, width: 112, height: 34)
 
         stopButton = NSButton(title: "停止并转写", target: self, action: #selector(stopRecording))
         stopButton.bezelStyle = .rounded
-        stopButton.frame = NSRect(x: 148, y: 58, width: 120, height: 34)
+        stopButton.frame = NSRect(x: 144, y: 70, width: 120, height: 34)
         stopButton.isEnabled = false
+
+        retranscribeButton = NSButton(title: "转写最新录音", target: self, action: #selector(retranscribeLatestRecording))
+        retranscribeButton.bezelStyle = .rounded
+        retranscribeButton.frame = NSRect(x: 272, y: 70, width: 120, height: 34)
 
         let folderButton = NSButton(title: "打开输出文件夹", target: self, action: #selector(openOutputFolder))
         folderButton.bezelStyle = .rounded
-        folderButton.frame = NSRect(x: 280, y: 58, width: 116, height: 34)
+        folderButton.frame = NSRect(x: 400, y: 70, width: 116, height: 34)
 
         let hintLabel = NSTextField(labelWithString: "播放电脑微信视频时保持本窗口或菜单栏 App 运行即可。")
         hintLabel.font = .systemFont(ofSize: 12)
         hintLabel.textColor = .tertiaryLabelColor
-        hintLabel.frame = NSRect(x: 24, y: 22, width: 360, height: 18)
+        hintLabel.frame = NSRect(x: 24, y: 30, width: 480, height: 18)
 
         contentView.addSubview(titleLabel)
         contentView.addSubview(windowStatusLabel)
         contentView.addSubview(startButton)
         contentView.addSubview(stopButton)
+        contentView.addSubview(retranscribeButton)
         contentView.addSubview(folderButton)
         contentView.addSubview(hintLabel)
 
@@ -144,7 +154,7 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
             return
         }
         let frame = screen.visibleFrame
-        let windowSize = NSSize(width: 420, height: 190)
+        let windowSize = NSSize(width: 540, height: 210)
         let origin = NSPoint(
             x: frame.midX - windowSize.width / 2,
             y: frame.maxY - windowSize.height - 80
@@ -192,24 +202,7 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
         Task {
             do {
                 let audioURL = try await recorder.stop()
-                let transcript = try await SpeechTranscriber(localeIdentifier: "zh-CN").transcribe(audioURL: audioURL)
-                let txtURL = audioURL.deletingPathExtension().appendingPathExtension("txt")
-                let mdURL = audioURL.deletingPathExtension().appendingPathExtension("md")
-                try transcript.write(to: txtURL, atomically: true, encoding: .utf8)
-                try DraftOrganizer.makeMarkdown(transcript: transcript, sourceAudioURL: audioURL)
-                    .write(to: mdURL, atomically: true, encoding: .utf8)
-
-                await MainActor.run {
-                    self.statusItem.button?.image = NSImage(systemSymbolName: "waveform.and.mic", accessibilityDescription: "微信视频文稿")
-                    self.statusItemText.title = "已生成：\(mdURL.lastPathComponent)"
-                    self.windowStatusLabel.stringValue = "已生成：\(mdURL.lastPathComponent)"
-                    self.isFinishingRecording = false
-                    self.startItem.isEnabled = true
-                    self.stopItem.isEnabled = false
-                    self.startButton.isEnabled = true
-                    self.stopButton.isEnabled = false
-                    NSWorkspace.shared.activateFileViewerSelecting([mdURL])
-                }
+                try await processAudio(audioURL)
             } catch {
                 await showError("无法完成转写", error)
                 await MainActor.run {
@@ -217,6 +210,42 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
                     self.setIdle()
                 }
             }
+        }
+    }
+
+    @objc private func retranscribeLatestRecording() {
+        setBusy("正在重新转写最新录音...")
+        Task {
+            do {
+                let audioURL = try latestRecordingURL()
+                try await processAudio(audioURL)
+            } catch {
+                await showError("无法重新转写", error)
+                await MainActor.run { self.setIdle() }
+            }
+        }
+    }
+
+    private func processAudio(_ audioURL: URL) async throws {
+        let transcript = try await SpeechTranscriber(localeIdentifier: "zh-CN").transcribe(audioURL: audioURL)
+        let txtURL = audioURL.deletingPathExtension().appendingPathExtension("txt")
+        let mdURL = audioURL.deletingPathExtension().appendingPathExtension("md")
+        try transcript.write(to: txtURL, atomically: true, encoding: .utf8)
+        try DraftOrganizer.makeMarkdown(transcript: transcript, sourceAudioURL: audioURL)
+            .write(to: mdURL, atomically: true, encoding: .utf8)
+
+        await MainActor.run {
+            self.statusItem.button?.image = NSImage(systemSymbolName: "waveform.and.mic", accessibilityDescription: "微信视频文稿")
+            self.statusItemText.title = "已生成：\(mdURL.lastPathComponent)"
+            self.windowStatusLabel.stringValue = "已生成：\(mdURL.lastPathComponent)"
+            self.isFinishingRecording = false
+            self.startItem.isEnabled = true
+            self.stopItem.isEnabled = false
+            self.retranscribeItem.isEnabled = true
+            self.startButton.isEnabled = true
+            self.stopButton.isEnabled = false
+            self.retranscribeButton.isEnabled = true
+            NSWorkspace.shared.activateFileViewerSelecting([mdURL])
         }
     }
 
@@ -234,8 +263,10 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
         windowStatusLabel?.stringValue = title
         startItem.isEnabled = false
         stopItem.isEnabled = false
+        retranscribeItem.isEnabled = false
         startButton?.isEnabled = false
         stopButton?.isEnabled = false
+        retranscribeButton?.isEnabled = false
     }
 
     private func setIdle() {
@@ -244,8 +275,10 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
         windowStatusLabel?.stringValue = "空闲"
         startItem.isEnabled = true
         stopItem.isEnabled = false
+        retranscribeItem.isEnabled = true
         startButton?.isEnabled = true
         stopButton?.isEnabled = false
+        retranscribeButton?.isEnabled = true
     }
 
     private func makeOutputURL(extension pathExtension: String) -> URL {
@@ -253,6 +286,23 @@ final class WeChatTranscriptApp: NSObject, NSApplicationDelegate {
         formatter.dateFormat = "yyyyMMdd-HHmmss"
         let filename = "wechat-video-\(formatter.string(from: Date())).\(pathExtension)"
         return outputDirectory.appendingPathComponent(filename)
+    }
+
+    private func latestRecordingURL() throws -> URL {
+        let urls = try FileManager.default.contentsOfDirectory(
+            at: outputDirectory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )
+        let recordings = urls.filter { $0.pathExtension.lowercased() == "m4a" }
+        guard let latest = recordings.max(by: { lhs, rhs in
+            let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let rhsDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return lhsDate < rhsDate
+        }) else {
+            throw AppError.noRecordingFound
+        }
+        return latest
     }
 
     @MainActor
@@ -564,6 +614,7 @@ private extension CMSampleBuffer {
 
 final class SpeechTranscriber {
     private let localeIdentifier: String
+    private let chunkDurationSeconds = 25.0
 
     init(localeIdentifier: String) {
         self.localeIdentifier = localeIdentifier
@@ -581,6 +632,26 @@ final class SpeechTranscriber {
             throw TranscriptionError.recognizerUnavailable
         }
 
+        let chunks = try await AudioChunker.makeChunks(from: audioURL, chunkDurationSeconds: chunkDurationSeconds)
+        defer {
+            for chunk in chunks where chunk != audioURL {
+                try? FileManager.default.removeItem(at: chunk)
+            }
+        }
+
+        var transcripts: [String] = []
+        for chunk in chunks {
+            let transcript = try await transcribeChunk(audioURL: chunk, recognizer: recognizer)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !transcript.isEmpty {
+                transcripts.append(transcript)
+            }
+        }
+
+        return transcripts.joined(separator: "\n")
+    }
+
+    private func transcribeChunk(audioURL: URL, recognizer: SFSpeechRecognizer) async throws -> String {
         let request = SFSpeechURLRecognitionRequest(url: audioURL)
         request.shouldReportPartialResults = false
         if recognizer.supportsOnDeviceRecognition {
@@ -641,6 +712,57 @@ final class SpeechTranscriber {
         let seconds = CMTimeGetSeconds(asset.duration)
         let boundedSeconds = min(max(seconds.isFinite ? seconds * 4 : 300, 60), 1_800)
         return UInt64(boundedSeconds * 1_000_000_000)
+    }
+}
+
+enum AudioChunker {
+    static func makeChunks(from audioURL: URL, chunkDurationSeconds: Double) async throws -> [URL] {
+        let asset = AVURLAsset(url: audioURL)
+        let duration = CMTimeGetSeconds(asset.duration)
+        guard duration.isFinite, duration > chunkDurationSeconds else {
+            return [audioURL]
+        }
+
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WeChatTranscriptChunks-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+
+        var chunks: [URL] = []
+        var start = 0.0
+        var index = 0
+        while start < duration {
+            let end = min(start + chunkDurationSeconds, duration)
+            let outputURL = tempDirectory.appendingPathComponent("chunk-\(String(format: "%03d", index)).m4a")
+            try await exportChunk(asset: asset, start: start, end: end, outputURL: outputURL)
+            chunks.append(outputURL)
+            start = end
+            index += 1
+        }
+        return chunks
+    }
+
+    private static func exportChunk(asset: AVURLAsset, start: Double, end: Double, outputURL: URL) async throws {
+        guard let exportSession = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
+            throw TranscriptionError.audioChunkExportFailed
+        }
+        exportSession.outputURL = outputURL
+        exportSession.outputFileType = .m4a
+        let startTime = CMTime(seconds: start, preferredTimescale: 600)
+        let duration = CMTime(seconds: end - start, preferredTimescale: 600)
+        exportSession.timeRange = CMTimeRange(start: startTime, duration: duration)
+
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            exportSession.exportAsynchronously {
+                switch exportSession.status {
+                case .completed:
+                    continuation.resume(returning: ())
+                case .failed, .cancelled:
+                    continuation.resume(throwing: exportSession.error ?? TranscriptionError.audioChunkExportFailed)
+                default:
+                    continuation.resume(throwing: TranscriptionError.audioChunkExportFailed)
+                }
+            }
+        }
     }
 }
 
@@ -754,10 +876,22 @@ enum RecorderError: LocalizedError {
     }
 }
 
+enum AppError: LocalizedError {
+    case noRecordingFound
+
+    var errorDescription: String? {
+        switch self {
+        case .noRecordingFound:
+            return "没有找到可重新转写的 .m4a 录音。"
+        }
+    }
+}
+
 enum TranscriptionError: LocalizedError {
     case speechPermissionDenied
     case recognizerUnavailable
     case transcriptionTimedOut
+    case audioChunkExportFailed
 
     var errorDescription: String? {
         switch self {
@@ -767,6 +901,8 @@ enum TranscriptionError: LocalizedError {
             return "中文语音识别服务暂不可用。"
         case .transcriptionTimedOut:
             return "语音识别超时，请尝试缩短录制时长或分段转写。"
+        case .audioChunkExportFailed:
+            return "音频分段失败，请检查录音文件是否完整。"
         }
     }
 }
