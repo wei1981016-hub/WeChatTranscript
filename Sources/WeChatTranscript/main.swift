@@ -640,15 +640,26 @@ final class SpeechTranscriber {
         }
 
         var transcripts: [String] = []
-        for chunk in chunks {
-            let transcript = try await transcribeChunk(audioURL: chunk, recognizer: recognizer)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !transcript.isEmpty {
-                transcripts.append(transcript)
+        for (index, chunk) in chunks.enumerated() {
+            do {
+                let transcript = try await transcribeChunk(audioURL: chunk, recognizer: recognizer)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !transcript.isEmpty {
+                    transcripts.append(transcript)
+                }
+            } catch {
+                if Self.isNoSpeechError(error) {
+                    continue
+                }
+                throw TranscriptionError.chunkTranscriptionFailed(index: index + 1, error: error)
             }
         }
 
-        return transcripts.joined(separator: "\n")
+        let transcript = transcripts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !transcript.isEmpty else {
+            throw TranscriptionError.noSpeechDetected
+        }
+        return transcript
     }
 
     private func transcribeChunk(audioURL: URL, recognizer: SFSpeechRecognizer) async throws -> String {
@@ -667,6 +678,7 @@ final class SpeechTranscriber {
             let stateQueue = DispatchQueue(label: "local.codex.WeChatTranscript.speech")
             var didResume = false
             var recognitionTask: SFSpeechRecognitionTask?
+            var bestTranscript = ""
 
             func finish(_ result: Result<String, Error>) {
                 stateQueue.async {
@@ -685,10 +697,21 @@ final class SpeechTranscriber {
             }
 
             recognitionTask = recognizer.recognitionTask(with: request) { result, error in
-                if let result, result.isFinal {
-                    finish(.success(result.bestTranscription.formattedString))
+                if let result {
+                    let transcript = result.bestTranscription.formattedString
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !transcript.isEmpty {
+                        bestTranscript = transcript
+                    }
+                    if result.isFinal {
+                        finish(.success(transcript))
+                    }
                 } else if let error {
-                    finish(.failure(error))
+                    if !bestTranscript.isEmpty {
+                        finish(.success(bestTranscript))
+                    } else {
+                        finish(.failure(error))
+                    }
                 }
             }
 
@@ -713,9 +736,19 @@ final class SpeechTranscriber {
         let boundedSeconds = min(max(seconds.isFinite ? seconds * 4 : 300, 60), 1_800)
         return UInt64(boundedSeconds * 1_000_000_000)
     }
+
+    private static func isNoSpeechError(_ error: Error) -> Bool {
+        let description = (error as NSError).localizedDescription.lowercased()
+        return description.contains("no speech")
+            || description.contains("speech not detected")
+            || description.contains("未检测到")
+            || description.contains("没有检测到")
+    }
 }
 
 enum AudioChunker {
+    private static let minimumTailSeconds = 5.0
+
     static func makeChunks(from audioURL: URL, chunkDurationSeconds: Double) async throws -> [URL] {
         let asset = AVURLAsset(url: audioURL)
         let duration = CMTimeGetSeconds(asset.duration)
@@ -731,7 +764,10 @@ enum AudioChunker {
         var start = 0.0
         var index = 0
         while start < duration {
-            let end = min(start + chunkDurationSeconds, duration)
+            var end = min(start + chunkDurationSeconds, duration)
+            if duration - end < minimumTailSeconds {
+                end = duration
+            }
             let outputURL = tempDirectory.appendingPathComponent("chunk-\(String(format: "%03d", index)).m4a")
             try await exportChunk(asset: asset, start: start, end: end, outputURL: outputURL)
             chunks.append(outputURL)
@@ -892,6 +928,8 @@ enum TranscriptionError: LocalizedError {
     case recognizerUnavailable
     case transcriptionTimedOut
     case audioChunkExportFailed
+    case noSpeechDetected
+    case chunkTranscriptionFailed(index: Int, error: Error)
 
     var errorDescription: String? {
         switch self {
@@ -903,6 +941,10 @@ enum TranscriptionError: LocalizedError {
             return "语音识别超时，请尝试缩短录制时长或分段转写。"
         case .audioChunkExportFailed:
             return "音频分段失败，请检查录音文件是否完整。"
+        case .noSpeechDetected:
+            return "没有检测到可转写的语音，请确认录音中包含清晰人声。"
+        case .chunkTranscriptionFailed(let index, let error):
+            return "第 \(index) 段音频转写失败：\(error.localizedDescription)"
         }
     }
 }
