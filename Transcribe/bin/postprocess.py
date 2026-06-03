@@ -27,6 +27,33 @@ WATERMARK_RE = re.compile(
 )
 
 
+CORRECTIONS_PATH = (
+    Path.home() / "Library" / "Application Support" / "WeChatTranscript" / "corrections.txt"
+)
+
+
+def load_corrections():
+    """读取纠错词典(每行 错误=正确,# 注释)。按错误词长度降序,先长后短避免子串冲突。"""
+    pairs = []
+    if CORRECTIONS_PATH.exists():
+        for line in CORRECTIONS_PATH.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            wrong, right = line.split("=", 1)
+            wrong, right = wrong.strip(), right.strip()
+            if wrong:
+                pairs.append((wrong, right))
+    pairs.sort(key=lambda p: len(p[0]), reverse=True)
+    return pairs
+
+
+def apply_corrections(text: str, pairs) -> str:
+    for wrong, right in pairs:
+        text = text.replace(wrong, right)
+    return text
+
+
 def strip_tokens(text: str) -> str:
     return TOKEN_RE.sub("", text).strip()
 
@@ -107,10 +134,13 @@ def main():
         segs.append(s)
     segs = dedup_overlap(segs)
 
+    corrections = load_corrections()
     paras = paragraphs_from_segments(segs)
-    paras = [to_simplified(p).strip() for p in paras]
+    paras = [apply_corrections(to_simplified(p).strip(), corrections) for p in paras]
     paras = [p for p in paras if p]
     full = "".join(paras)
+    if corrections:
+        print(f"  已应用纠错词典 {len(corrections)} 条")
 
     txt_path = path.with_suffix(".txt")
     md_path = path.with_suffix(".md")

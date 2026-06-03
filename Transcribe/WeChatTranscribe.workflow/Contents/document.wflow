@@ -61,14 +61,21 @@
 					<key>COMMAND_STRING</key>
 					<string>#!/bin/bash
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
-BASE="$HOME/Documents/WeChatTranscript"
+APPSUP="$HOME/Library/Application Support/WeChatTranscript"
 LOG="/tmp/wct-quickaction.log"
+mkdir -p "$APPSUP/work"
 for f in "$@"; do
   osascript -e 'display notification "开始转写,大约几分钟,请稍候…" with title "微信转写"'
-  if "$BASE/transcribe.sh" "$f" &gt; "$LOG" 2&gt;&amp;1; then
-    stem="$(basename "${f%.*}")"
+  base="$(basename "$f")"
+  if ! cp "$f" "$APPSUP/work/$base" 2&gt; "$LOG"; then
+    osascript -e 'display notification "无法读取所选文件" with title "微信转写"'
+    continue
+  fi
+  if "$APPSUP/bin/transcribe.sh" "$APPSUP/work/$base" &gt;&gt; "$LOG" 2&gt;&amp;1; then
+    stem="${base%.*}"
+    rm -f "$APPSUP/work/$base"
     osascript -e "display notification \"完成:${stem}.txt\" with title \"微信转写\""
-    open -R "$BASE/transcripts/${stem}.txt"
+    open "$APPSUP/transcripts"
   else
     osascript -e 'display notification "转写失败,详见日志" with title "微信转写"'
     open "$LOG"
